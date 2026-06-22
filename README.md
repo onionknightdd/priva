@@ -42,14 +42,15 @@ priva/
 
 ## Quickstart
 
-**Prerequisites:** Python ≥ 3.12, Node ≥ 18 (for the web console), and an
-Anthropic API key (or a compatible gateway).
+**Prerequisites:** [uv](https://docs.astral.sh/uv/), Python 3.12 or 3.13,
+Node ≥ 18 (for the web console), and an Anthropic API key (or a compatible
+gateway).
 
 ### 1. Backend
 
 ```bash
 # from the repo root
-pip install -r requirements.txt
+uv sync --locked
 
 # configure (optional — sensible defaults are built in)
 cp priva/api/config.example.yaml priva/api/config.yaml
@@ -59,19 +60,53 @@ cp priva/api/config.example.yaml priva/api/config.yaml
 export ANTHROPIC_API_KEY=sk-ant-...
 
 # launch (server + scheduler + channels)
-priva/bin/server.sh
+./priva/bin/server.sh start
 ```
 
 The API listens on `http://localhost:8001` by default (override via
 `server.port` in `config.yaml`).
 
-### 2. Web console
+The launcher automatically uses the locked uv environment when no configured
+Conda environment is active.
+
+### 2. Conda alternative
+
+The existing Conda workflow remains supported:
+
+```bash
+conda create -n priva python=3.12
+conda activate priva
+python -m pip install -r requirements.txt
+
+export ANTHROPIC_API_KEY=sk-ant-...
+./priva/bin/server.sh start
+```
+
+When Conda is active, `server.sh` uses `$CONDA_PREFIX/bin/python` before
+considering uv. `requirements.txt` is generated from `uv.lock` and exists only
+as a Conda/pip compatibility artifact.
+
+### 3. Web console
 
 ```bash
 cd priva/web
 npm install
+VITE_API_TARGET=http://localhost:8001 \
+VITE_BACKEND_URL=http://localhost:8001 \
 npm run dev        # development
 # or: npm run build   # production bundle into priva/web/dist
+```
+
+### 4. Development commands
+
+```bash
+uv lock                    # refresh the lock after editing pyproject.toml
+uv sync --locked           # synchronize runtime and development dependencies
+uv run pytest              # run tests
+
+# regenerate the Conda/pip compatibility file
+uv export --locked --no-dev --no-hashes --no-annotate --no-header \
+  --no-emit-project --output-file requirements.txt
 ```
 
 ## Configuration
@@ -85,7 +120,8 @@ npm run dev        # development
 ## Packaging
 
 `./pack.sh` builds a self‑contained release tarball (optionally bundling
-dependency wheels for a target Python version). See `pack.sh --help`.
+dependency wheels for a target Python version). Packaging exports its
+compatibility requirements directly from `uv.lock`. See `pack.sh --help`.
 
 ## License
 

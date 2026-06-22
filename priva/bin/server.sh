@@ -8,6 +8,13 @@ set -e
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+UV_PROJECT_ROOT=""
+for candidate in "${PROJECT_ROOT}" "$(dirname "${PROJECT_ROOT}")"; do
+    if [ -f "${candidate}/pyproject.toml" ] && [ -f "${candidate}/uv.lock" ]; then
+        UV_PROJECT_ROOT="${candidate}"
+        break
+    fi
+done
 PID_FILE="${SCRIPT_DIR}/server.pid"
 SCHEDULER_PID_FILE="${SCRIPT_DIR}/scheduler.pid"
 CONFIG_FILE="${PROJECT_ROOT}/api/config.yaml"
@@ -44,21 +51,15 @@ export PRIVA_HOME="${PRIVA_HOME:-$HOME/.config}"
 # restarts. Shared by all uvicorn workers.
 export PROMETHEUS_MULTIPROC_DIR="${PRIVA_HOME}/priva/.prometheus-multiproc"
 
-# Select a Python interpreter that can read YAML config and run uvicorn.
-select_python_bin() {
-    local candidates=()
-
-    if [ -n "${PYTHON_BIN:-}" ]; then
-        candidates+=("${PYTHON_BIN}")
-    fi
-    candidates+=("python" "python3")
-
-    for candidate in "${candidates[@]}"; do
-        if ! command -v "${candidate}" >/dev/null 2>&1; then
-            continue
-        fi
-
-        if "${candidate}" - <<'PY' >/dev/null 2>&1
+# Select a Python runtime that can read YAML config and run uvicorn.
+#
+# Priority:
+#   1. Explicit PYTHON_BIN override
+#   2. Currently activated Conda environment
+#   3. uv project environment
+#   4. python / python3 from PATH
+python_has_runtime_deps() {
+    "$@" - <<'PY' >/dev/null 2>&1
 import importlib.util
 import sys
 
@@ -66,8 +67,49 @@ required = ("yaml", "uvicorn")
 missing = [name for name in required if importlib.util.find_spec(name) is None]
 sys.exit(0 if not missing else 1)
 PY
-        then
-            echo "${candidate}"
+}
+
+PYTHON_CMD=()
+PYTHON_RUNTIME=""
+
+select_python_command() {
+    local candidate
+    local uv_cmd=()
+
+    if [ -n "${PYTHON_BIN:-}" ]; then
+        if command -v "${PYTHON_BIN}" >/dev/null 2>&1 && python_has_runtime_deps "${PYTHON_BIN}"; then
+            PYTHON_CMD=("${PYTHON_BIN}")
+            PYTHON_RUNTIME="explicit interpreter: ${PYTHON_BIN}"
+            return 0
+        fi
+        echo "[ERROR] PYTHON_BIN does not point to a Python interpreter with yaml and uvicorn: ${PYTHON_BIN}" >&2
+        return 1
+    fi
+
+    if [ -n "${CONDA_PREFIX:-}" ]; then
+        candidate="${CONDA_PREFIX}/bin/python"
+        if [ -x "${candidate}" ] && python_has_runtime_deps "${candidate}"; then
+            PYTHON_CMD=("${candidate}")
+            PYTHON_RUNTIME="Conda environment: ${CONDA_DEFAULT_ENV:-${CONDA_PREFIX}}"
+            return 0
+        fi
+    fi
+
+    if [ -n "${UV_PROJECT_ROOT}" ] && command -v uv >/dev/null 2>&1; then
+        if uv sync --project "${UV_PROJECT_ROOT}" --locked --no-dev --inexact >/dev/null 2>&1; then
+            uv_cmd=(uv run --project "${UV_PROJECT_ROOT}" --no-sync --no-dev python)
+        fi
+        if [ ${#uv_cmd[@]} -gt 0 ] && python_has_runtime_deps "${uv_cmd[@]}"; then
+            PYTHON_CMD=("${uv_cmd[@]}")
+            PYTHON_RUNTIME="uv project: ${UV_PROJECT_ROOT}"
+            return 0
+        fi
+    fi
+
+    for candidate in python python3; do
+        if command -v "${candidate}" >/dev/null 2>&1 && python_has_runtime_deps "${candidate}"; then
+            PYTHON_CMD=("${candidate}")
+            PYTHON_RUNTIME="PATH interpreter: $(command -v "${candidate}")"
             return 0
         fi
     done
@@ -75,15 +117,16 @@ PY
     return 1
 }
 
-PYTHON_BIN=$(select_python_bin) || {
-    echo "[ERROR] Could not find a Python interpreter with both 'yaml' and 'uvicorn' installed." >&2
+select_python_command || {
+    echo "[ERROR] Could not find a usable Python runtime." >&2
+    echo "[ERROR] Run 'uv sync --locked', activate a configured Conda environment, or set PYTHON_BIN." >&2
     exit 1
 }
 
 # Read settings from config.yaml via Python
 read_config() {
     local key="$1" default="$2"
-    "${PYTHON_BIN}" -c "
+    "${PYTHON_CMD[@]}" -c "
 import yaml
 with open('${CONFIG_FILE}') as f:
     cfg = yaml.safe_load(f) or {}
@@ -102,6 +145,14 @@ HOST=$(read_config server.host 0.0.0.0)
 PORT=$(read_config server.port 8001)
 DEBUG="${DEBUG:-$(read_config server.debug False)}"
 ENABLE_RELOAD="${ENABLE_RELOAD:-auto}"
+WORK_DIR_RAW=$(read_config server.work_dir "~/priva_workspace")
+WORK_DIR=$("${PYTHON_CMD[@]}" - "${WORK_DIR_RAW}" <<'PY'
+import os
+import sys
+
+print(os.path.abspath(os.path.expanduser(sys.argv[1])))
+PY
+)
 SERVER_LOG=$(read_config logging.server.path logs/server.log)
 APP_LOG=$(read_config logging.app.path logs/app.log)
 ACCESS_LOG=$(read_config logging.access.path logs/access.log)
@@ -307,7 +358,7 @@ describe_port_usage() {
 
 # Verify the live app exposes the expected API routes before reporting startup success.
 verify_api_routes() {
-    "${PYTHON_BIN}" - "${HOST}" "${PORT}" <<'PY'
+    "${PYTHON_CMD[@]}" - "${HOST}" "${PORT}" <<'PY'
 import json
 import sys
 import urllib.request
@@ -452,7 +503,7 @@ start_scheduler() {
     log_info "Starting scheduler daemon..."
 
     cd "${PROJECT_ROOT}"
-    nohup ${PYTHON_BIN} -m api.services.scheduler.daemon >/dev/null 2>&1 &
+    nohup "${PYTHON_CMD[@]}" -m api.services.scheduler.daemon >/dev/null 2>&1 &
     local pid=$!
     echo "${pid}" > "${SCHEDULER_PID_FILE}"
     log_info "Scheduler daemon started with PID: ${pid}"
@@ -469,20 +520,13 @@ start_scheduler() {
             return 1
         fi
 
-        # Check heartbeat freshness
-        local hb_file
-        hb_file=$("${PYTHON_BIN}" -c "
-import yaml, os
-with open('${CONFIG_FILE}') as f:
-    cfg = yaml.safe_load(f) or {}
-work_dir = cfg.get('server', {}).get('work_dir', '~/priva_workspace')
-work_dir = os.path.expanduser(work_dir)
-print(os.path.join(work_dir, '.scheduler', 'heartbeat'))
-" 2>/dev/null)
+        # Check heartbeat freshness. WORK_DIR already includes config defaults,
+        # so this also works when the optional config.yaml is absent.
+        local hb_file="${WORK_DIR}/.scheduler/heartbeat"
 
         if [ -f "${hb_file}" ]; then
             local hb_ts
-            hb_ts=$("${PYTHON_BIN}" -c "
+            hb_ts=$("${PYTHON_CMD[@]}" -c "
 from datetime import datetime, timezone
 with open('${hb_file}') as f:
     ts = f.read().strip()
@@ -579,7 +623,7 @@ start_channels() {
     log_info "Starting channels daemon..."
 
     cd "${PROJECT_ROOT}"
-    nohup ${PYTHON_BIN} -m api.services.channels.daemon >/dev/null 2>&1 &
+    nohup "${PYTHON_CMD[@]}" -m api.services.channels.daemon >/dev/null 2>&1 &
     local pid=$!
     echo "${pid}" > "${CHANNELS_PID_FILE}"
     log_info "Channels daemon started with PID: ${pid}"
@@ -596,20 +640,13 @@ start_channels() {
             return 1
         fi
 
-        # Check heartbeat freshness
-        local hb_file
-        hb_file=$("${PYTHON_BIN}" -c "
-import yaml, os
-with open('${CONFIG_FILE}') as f:
-    cfg = yaml.safe_load(f) or {}
-work_dir = cfg.get('server', {}).get('work_dir', '~/priva_workspace')
-work_dir = os.path.expanduser(work_dir)
-print(os.path.join(work_dir, '.channels', 'heartbeat'))
-" 2>/dev/null)
+        # Check heartbeat freshness. WORK_DIR already includes config defaults,
+        # so this also works when the optional config.yaml is absent.
+        local hb_file="${WORK_DIR}/.channels/heartbeat"
 
         if [ -f "${hb_file}" ]; then
             local hb_ts
-            hb_ts=$("${PYTHON_BIN}" -c "
+            hb_ts=$("${PYTHON_CMD[@]}" -c "
 with open('${hb_file}') as f:
     ts = f.read().strip()
 print(int(float(ts)))
@@ -687,7 +724,7 @@ do_start() {
     fi
 
     # Build uvicorn command
-    local cmd="${PYTHON_BIN} -m uvicorn ${API_APP} --host ${HOST} --port ${PORT} --workers ${WORKERS} --no-access-log"
+    local cmd=("${PYTHON_CMD[@]}" -m uvicorn "${API_APP}" --host "${HOST}" --port "${PORT}" --workers "${WORKERS}" --no-access-log)
 
     # Auto-enable reload in debug mode unless explicitly disabled.
     local use_reload="false"
@@ -698,7 +735,7 @@ do_start() {
     fi
 
     if [ "${use_reload}" = "true" ]; then
-        cmd="${cmd} --reload"
+        cmd+=(--reload)
         log_info "Debug mode enabled, auto-reload ON"
     fi
 
@@ -707,8 +744,9 @@ do_start() {
 
     # Start server in background
     cd "${PROJECT_ROOT}"
+    log_info "Python runtime: ${PYTHON_RUNTIME}"
     log_info "Starting with host=${HOST}, port=${PORT}, workers=${WORKERS}"
-    nohup ${cmd} >/dev/null 2>&1 &
+    nohup "${cmd[@]}" >/dev/null 2>&1 &
     local pid=$!
 
     # Save PID
@@ -853,6 +891,7 @@ do_status() {
 
     # Server info
     echo -e "${BLUE}Server Configuration:${NC}"
+    echo "  Python:      ${PYTHON_RUNTIME}"
     echo "  Host:        ${HOST}"
     echo "  Port:        ${PORT}"
     echo "  Debug:       ${DEBUG}"
@@ -968,6 +1007,7 @@ show_usage() {
     echo "  WORKERS  - Number of worker processes (default: 1)"
     echo "  DEBUG    - Override debug mode from config"
     echo "  ENABLE_RELOAD - Control uvicorn reload: true, false, or auto (default)"
+    echo "  PYTHON_BIN - Explicit Python interpreter (overrides Conda and uv)"
     echo "  PRIVA_HOME   - Parent dir for state files. Resolved dir is \$PRIVA_HOME/priva/ (default: ~/.config)"
     echo "  PROMETHEUS_MULTIPROC_DIR - Prometheus multiprocess dir (auto: \$PRIVA_HOME/priva/.prometheus-multiproc, wiped each boot)"
     echo ""
@@ -975,6 +1015,7 @@ show_usage() {
     echo "  ./server.sh start"
     echo "  ./server.sh status"
     echo "  WORKERS=4 ./server.sh start"
+    echo "  conda activate priva && ./server.sh start"
     echo "  ENABLE_RELOAD=false ./server.sh start"
     echo ""
 }

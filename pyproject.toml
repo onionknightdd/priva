@@ -1,0 +1,59 @@
+[project]
+name = "priva"
+version = "1.0.0"
+description = "A private, self-hosted personal AI assistant built on the Claude Agent SDK."
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = "MIT"
+dependencies = [
+    "apscheduler>=3.10,<4",
+    "bcrypt",
+    "beautifulsoup4",
+    "claude-agent-sdk==0.1.81",
+    "cryptography",
+    "defusedxml",
+    "ebooklib",
+    "fastapi",
+    "formulas",
+    "httpx",
+    "loguru",
+    "lxml",
+    "markitdown[pptx]",
+    "mcp>=1.19.0",
+    "odfpy",
+    "openpyxl",
+    "opentelemetry-api>=1.41.1",
+    "pandas",
+    "pdfplumber",
+    "pillow",
+    "prometheus-client",
+    "pydantic>=2.10",
+    "pydantic-settings",
+    "pymupdf",
+    "pypdf",
+    "python-docx",
+    "python-jose[cryptography]",
+    "python-multipart",
+    "python-pptx",
+    "pyyaml",
+    "reportlab",
+    "ruff",
+    "scalar-fastapi",
+    "speechrecognition==3.14.3",
+    "uvicorn[standard]",
+    "websockets",
+    "wecom-aibot-python-sdk",
+    "xlrd",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

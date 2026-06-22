@@ -11,7 +11,7 @@
 #                           Default: 2_17 (manylinux2014)
 #   --python-version VER    Python version for wheel compatibility (e.g. 3.12, 3.13)
 #                           Default: 3.12
-#   --no-deps               Download wheels without dependencies (only packages listed in requirements.txt)
+#   --no-deps               Download only direct dependencies from pyproject.toml
 #
 # Produces: priva-<version>-<platform>.tar.gz
 #   e.g. priva-1.0.0-linux-glibc2_17.tar.gz
@@ -31,11 +31,11 @@
 #   cd priva-1.0.0-linux-glibc2_17
 #
 #   # If packed without --include-dependency (online install):
-#   pip install -r requirements.txt
+#   uv sync --locked --no-dev
 #   npm install -g pm2 docx pptxgenjs pdf-lib pdfjs-dist react react-dom react-icons sharp @anthropic-ai/claude-code
 #
 #   # If packed with --include-dependency (offline install):
-#   pip install --no-index --find-links lib/py -r requirements.txt
+#   uv sync --locked --no-dev --offline --no-index --find-links lib/py
 #   npm install -g --offline --cache lib/npm-cache pm2 docx pptxgenjs pdf-lib pdfjs-dist react react-dom react-icons sharp @anthropic-ai/claude-code
 #
 #   bin/server.sh start
@@ -113,6 +113,30 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+if ! command -v uv >/dev/null 2>&1; then
+    log_error "uv is required to build a release package."
+    log_error "Install it from https://docs.astral.sh/uv/ and retry."
+    exit 1
+fi
+
+PACK_REQUIREMENTS=$(mktemp)
+DIRECT_REQUIREMENTS=$(mktemp)
+trap 'rm -f "${PACK_REQUIREMENTS}" "${DIRECT_REQUIREMENTS}"' EXIT
+
+# requirements.txt is a compatibility artifact for Conda/pip deployments.
+# pyproject.toml and uv.lock remain the dependency source of truth.
+uv export --locked --no-dev --no-hashes --no-annotate --no-header \
+    --no-emit-project --output-file "${PACK_REQUIREMENTS}" >/dev/null
+
+uv run --locked --no-dev --inexact python - "${DIRECT_REQUIREMENTS}" <<'PY'
+from pathlib import Path
+import sys
+import tomllib
+
+project = tomllib.loads(Path("pyproject.toml").read_text())
+Path(sys.argv[1]).write_text("\n".join(project["project"]["dependencies"]) + "\n")
+PY
 
 # Resolve full platform string
 if [ -z "${PLATFORM}" ]; then
@@ -193,7 +217,10 @@ cp -r priva/api    "${DIST_DIR}/${ARCHIVE_NAME}/api"
 cp -r priva/bin    "${DIST_DIR}/${ARCHIVE_NAME}/bin"
 mkdir -p "${DIST_DIR}/${ARCHIVE_NAME}/web"
 cp -r priva/web/dist "${DIST_DIR}/${ARCHIVE_NAME}/web/dist"
-cp    requirements.txt "${DIST_DIR}/${ARCHIVE_NAME}/requirements.txt"
+cp    pyproject.toml "${DIST_DIR}/${ARCHIVE_NAME}/pyproject.toml"
+cp    uv.lock "${DIST_DIR}/${ARCHIVE_NAME}/uv.lock"
+cp    .python-version "${DIST_DIR}/${ARCHIVE_NAME}/.python-version"
+cp    "${PACK_REQUIREMENTS}" "${DIST_DIR}/${ARCHIVE_NAME}/requirements.txt"
 
 # Vite's vite-plugin-static-copy already copies public/fonts into dist/fonts
 # during `npm run build`. Only fall back to a manual copy when the build
@@ -213,10 +240,10 @@ if [ "${INCLUDE_DEPENDENCY}" = "true" ]; then
 
     log_info "Downloading Python packages for platform: ${PLATFORM_TAGS[*]}, python: ${PYTHON_VERSION}"
 
-    PIP_COMMON_ARGS=()
+    DOWNLOAD_REQUIREMENTS="${PACK_REQUIREMENTS}"
     if [ "${NO_DEPS}" = "true" ]; then
-        PIP_COMMON_ARGS+=(--no-deps)
-        log_info "Downloading without transitive dependencies (--no-deps)"
+        DOWNLOAD_REQUIREMENTS="${DIRECT_REQUIREMENTS}"
+        log_info "Downloading direct dependencies only (--no-deps)"
     fi
 
     # Build --platform flags (pip accepts multiple)
@@ -235,12 +262,12 @@ if [ "${INCLUDE_DEPENDENCY}" = "true" ]; then
             "${PLATFORM_FLAGS[@]}" \
             --python-version "${PYTHON_VERSION}" \
             --only-binary=:all: \
-            "${PIP_COMMON_ARGS[@]}" 2>&1; then
+            --no-deps 2>&1; then
             :
         else
             PASS2_PKGS+=("${pkg}")
         fi
-    done < requirements.txt
+    done < "${DOWNLOAD_REQUIREMENTS}"
 
     if [ ${#PASS2_PKGS[@]} -gt 0 ]; then
         log_warn "Pass 2: retrying as pure-Python (noarch/sdist only): ${PASS2_PKGS[*]}"
@@ -279,7 +306,7 @@ if [ "${INCLUDE_DEPENDENCY}" = "true" ]; then
             log_error ""
             log_error "Options:"
             log_error "  1. Raise glibc baseline: --glibc 2_28 (or 2_34)"
-            log_error "  2. Pin an older version of the package in requirements.txt"
+            log_error "  2. Pin an older version in pyproject.toml and refresh uv.lock"
             log_error "  3. Add additional manylinux tags to PLATFORM_TAGS in pack.sh"
             exit 1
         fi
@@ -339,7 +366,13 @@ if [ "${INCLUDE_DEPENDENCY}" = "true" ]; then
 **Python 依赖：**
 
 \`\`\`bash
-pip install --no-index --find-links lib/py -r requirements.txt
+uv sync --locked --no-dev --offline --no-index --find-links lib/py
+\`\`\`
+
+如果使用已激活的 Conda 环境：
+
+\`\`\`bash
+python -m pip install --no-index --find-links lib/py -r requirements.txt
 \`\`\`
 
 **NPM 依赖：**
@@ -357,7 +390,13 @@ else
 **Python 依赖：**
 
 \`\`\`bash
-pip install -r requirements.txt
+uv sync --locked --no-dev
+\`\`\`
+
+如果使用已激活的 Conda 环境：
+
+\`\`\`bash
+python -m pip install -r requirements.txt
 \`\`\`
 
 **NPM 依赖：**
@@ -381,7 +420,8 @@ cat > "${DIST_DIR}/${ARCHIVE_NAME}/README.md" << READMEEOF
 
 | 项目 | 要求 |
 |------|------|
-| Python | >= 3.12 |
+| Python | 3.12 或 3.13 |
+| uv | 最新稳定版（Conda 模式可选） |
 | Node.js | >= 18 |
 | npm | >= 9 |
 | 操作系统 | Linux x86_64 / macOS ARM64 |
@@ -471,7 +511,9 @@ ${ARCHIVE_NAME}/
 ├── web/
 │   └── dist/             # 前端构建产物
 ├── logs/                 # 日志目录（运行后生成）
-├── requirements.txt      # Python 依赖清单
+├── pyproject.toml         # Python 项目与直接依赖
+├── uv.lock                # 完整锁文件
+├── requirements.txt      # 从 uv.lock 导出的 Conda/pip 兼容清单
 $([ "${INCLUDE_DEPENDENCY}" = "true" ] && echo "├── lib/
 │   ├── py/               # Python 离线包
 │   └── npm-cache/        # NPM 离线缓存")
@@ -509,12 +551,14 @@ lsof -i :8081
 npm install -g --offline --cache lib/npm-cache ${NPM_INSTALL_LIST}
 \`\`\`
 
-**Q: pip 安装报找不到包？**
+**Q: 离线 uv/Conda 安装报找不到包？**
 
-确保使用 \`--no-index --find-links lib/py\` 参数：
+确认安装命令包含 \`--no-index --find-links lib/py\`：
 
 \`\`\`bash
-pip install --no-index --find-links lib/py -r requirements.txt
+uv sync --locked --no-dev --offline --no-index --find-links lib/py
+# Conda 环境：
+python -m pip install --no-index --find-links lib/py -r requirements.txt
 \`\`\`
 
 **Q: 服务启动超时？**
@@ -565,10 +609,10 @@ log_info "    1. Copy ${ARCHIVE_NAME}.tar.gz to the UAT server"
 log_info "    2. tar xzf ${ARCHIVE_NAME}.tar.gz"
 log_info "    3. cd ${ARCHIVE_NAME}"
 if [ "${INCLUDE_DEPENDENCY}" = "true" ]; then
-    log_info "    4. pip install --no-index --find-links lib/py -r requirements.txt"
+    log_info "    4. uv sync --locked --no-dev --offline --no-index --find-links lib/py"
     log_info "    5. npm install -g --offline --cache lib/npm-cache ${NPM_INSTALL_LIST}"
 else
-    log_info "    4. pip install -r requirements.txt"
+    log_info "    4. uv sync --locked --no-dev"
     log_info "    5. npm install -g ${NPM_INSTALL_LIST}"
 fi
 log_info "    6. bin/server.sh start"
